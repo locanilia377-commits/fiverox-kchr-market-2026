@@ -41,6 +41,7 @@ button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,te
 .table-head,thead,th{background:#f4f7f1;color:var(--muted)}
 .research-toolbar{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:16px;margin-bottom:20px}.research-toolbar h1{font-size:clamp(24px,3vw,34px);margin:0}.research-frame{display:block;width:100%;height:calc(100dvh - 220px);min-height:480px;border:1px solid var(--line);border-radius:14px;background:var(--bg)}
 .lead-card.pending-move{border:2px solid #689d81;opacity:.82;cursor:progress}.lead-card.move-uncertain{border-color:#923f32;cursor:pointer;opacity:1}.move-status{display:block;font-size:11px;line-height:1.45;color:#126e59;font-weight:650;margin:7px 0}.move-uncertain .move-status{color:#923f32}
+.pointer-kanban .lead-card{-webkit-user-drag:none;-webkit-user-select:none;user-select:none}.pointer-kanban .lead-card[draggable="true"]{cursor:grab}.pointer-kanban .lead-card.dragging{opacity:.45;cursor:grabbing}.kanban-drag-preview{position:fixed!important;z-index:1000!important;pointer-events:none!important;margin:0!important;opacity:.85!important;box-shadow:0 12px 32px #102c2b30;transform:rotate(2deg)}
 @media(max-width:760px){.research-toolbar{align-items:flex-start}.research-toolbar .btn{width:100%}.research-frame{min-height:65dvh;height:75dvh}}
 </style><script>window.FIVEROX_PLATFORM_CONFIG=Object.freeze({"pilotEnabled": true, "backendUrl": "https://script.google.com/macros/s/AKfycbxvpmIvlj9KyLdnK1gWnzAkFsA92nufG4ogUSvLw9LhJXJD04auaGvt-dQ9eXqqMn4A/exec", "name": "FIVEROX · КЧР · CRM", "organization": "FIVEROX"});</script><meta name="application-version" content="kchr-crm-20261117-r5"></head>
 <body>
@@ -205,7 +206,7 @@ function upsertById(items,record){if(!record||typeof record.id!=='string'||!reco
 // Board moves keep the interface responsive; only the affected card is pending.
 const pendingMoves=new Map();
 let writeQueue=Promise.resolve();
-function resetClientWrites(){pendingMoves.clear();writeQueue=Promise.resolve();}
+function resetClientWrites(){if(typeof cancelPointerKanban==='function')cancelPointerKanban();pendingMoves.clear();writeQueue=Promise.resolve();}
 function crmClientError(error){
   const result=new Error(errorText(error));
   result.code=error?.code||error?.message?.match(/^(CRM_[A-Z_]+):/)?.[1]||'';
@@ -355,6 +356,80 @@ function perfHandleDrop(event){
   event.preventDefault();const stage=column.dataset.stage;finishDrag();return startMove(id,stage);
 }
 function retryPendingMove(id){const entry=pendingMoves.get(id);if(entry?.state==='uncertain')return commitPendingMove(entry);}
+
+// Desktop Pointer Events avoid Safari's OS drag session and keep the board local
+// until release. Touch scrolling and keyboard activation retain their defaults.
+let pointerKanban=null, suppressKanbanClickUntil=0;
+function cancelPointerKanban(){
+  const drag=pointerKanban;pointerKanban=null;if(!drag)return;
+  if(drag.started)suppressKanbanClickUntil=performance.now()+450;
+  if(drag.frame)cancelAnimationFrame(drag.frame);
+  drag.preview?.remove();drag.card.classList.remove('dragging');
+  if(drag.card.hasPointerCapture?.(drag.pointerId))drag.card.releasePointerCapture(drag.pointerId);
+  finishDrag();
+}
+function pointerKanbanColumn(x,y){
+  const column=document.elementFromPoint(x,y)?.closest('.column');
+  return column&&$('main').contains(column)?column:null;
+}
+function paintPointerKanban(){
+  const drag=pointerKanban;if(!drag?.started)return;
+  drag.preview.style.left=(drag.x+14)+'px';drag.preview.style.top=(drag.y+14)+'px';
+  const column=pointerKanbanColumn(drag.x,drag.y);
+  if(column!==drag.column){document.querySelectorAll('.drop-target').forEach(node=>node.classList.remove('drop-target'));column?.classList.add('drop-target');drag.column=column;}
+}
+function scrollPointerKanban(){
+  const drag=pointerKanban;if(!drag?.started)return;
+  drag.frame=0;const board=$('main').querySelector('.board');
+  if(board){const box=board.getBoundingClientRect(),edge=44;
+    if(drag.y>=box.top&&drag.y<=box.bottom){
+      const direction=drag.x<box.left+edge?-1:drag.x>box.right-edge?1:0;
+      if(direction){board.scrollLeft+=direction*10;paintPointerKanban();}
+    }
+  }
+  drag.frame=requestAnimationFrame(scrollPointerKanban);
+}
+function beginPointerKanban(event){
+  if(event.button!==0||event.isPrimary===false||!['mouse','pen'].includes(event.pointerType)||saving||loading||!canEdit())return;
+  const card=event.target.closest('.lead-card[draggable="true"]');
+  if(!card||card.disabled||pendingMoves.has(card.dataset.id))return;
+  cancelPointerKanban();event.preventDefault();card.focus({preventScroll:true});
+  pointerKanban={pointerId:event.pointerId,id:card.dataset.id,card,startX:event.clientX,startY:event.clientY,x:event.clientX,y:event.clientY,started:false,view:viewId,frame:0};
+  card.setPointerCapture(event.pointerId);
+}
+function movePointerKanban(event){
+  const drag=pointerKanban;if(!drag||drag.pointerId!==event.pointerId)return;
+  if(drag.view!==viewId||saving||loading||!canEdit()){cancelPointerKanban();return;}
+  drag.x=event.clientX;drag.y=event.clientY;
+  if(!drag.started){
+    if(Math.hypot(drag.x-drag.startX,drag.y-drag.startY)<6)return;
+    drag.started=true;drag.card.classList.add('dragging');
+    const preview=drag.card.cloneNode(true);preview.removeAttribute('id');preview.removeAttribute('data-action');preview.classList.remove('dragging');preview.classList.add('kanban-drag-preview');preview.setAttribute('aria-hidden','true');preview.tabIndex=-1;preview.draggable=false;
+    preview.style.width=drag.card.getBoundingClientRect().width+'px';document.body.append(preview);drag.preview=preview;
+    drag.frame=requestAnimationFrame(scrollPointerKanban);
+  }
+  event.preventDefault();paintPointerKanban();
+}
+function endPointerKanban(event){
+  const drag=pointerKanban;if(!drag||drag.pointerId!==event.pointerId)return;
+  const column=drag.started?pointerKanbanColumn(event.clientX,event.clientY):null,stage=column?.dataset.stage;
+  if(drag.started){event.preventDefault();suppressKanbanClickUntil=performance.now()+450;}
+  cancelPointerKanban();
+  if(stage&&drag.view===viewId)return startMove(drag.id,stage);
+}
+function initializePointerKanban(){
+  if(!('PointerEvent' in window))return;
+  document.documentElement.classList.add('pointer-kanban');
+  $('main').addEventListener('pointerdown',beginPointerKanban);
+  window.addEventListener('pointermove',movePointerKanban,{passive:false});
+  window.addEventListener('pointerup',endPointerKanban);
+  window.addEventListener('pointercancel',cancelPointerKanban);
+  $('main').addEventListener('lostpointercapture',event=>{if(pointerKanban?.pointerId===event.pointerId)cancelPointerKanban();});
+  window.addEventListener('blur',cancelPointerKanban);
+  $('main').addEventListener('click',event=>{if(event.detail>0&&performance.now()<suppressKanbanClickUntil&&event.target.closest('.lead-card')){event.preventDefault();event.stopImmediatePropagation();}},true);
+  $('main').addEventListener('dragstart',event=>{if(pointerKanban)event.preventDefault();},true);
+  window.addEventListener('keydown',event=>{if(event.key==='Escape'&&pointerKanban){event.preventDefault();cancelPointerKanban();}});
+}
 
 
 const $=id=>document.getElementById(id);
@@ -543,6 +618,7 @@ window.addEventListener('hashchange',()=>{const next=location.hash.slice(1)||'le
 let restoringSession=null;
 
 async function initialize(){screen=allRoutes().some(r=>r[0]===location.hash.slice(1))?location.hash.slice(1):'leads';$('appShell').hidden=false;$('authScreen').hidden=true;$('identityEmail').textContent='Личный кабинет';$('identityRole').textContent='Вход';$('avatar').textContent='?';$('signOut').hidden=true;render();if(apiAvailable())await restoreSession();}
+initializePointerKanban();
 initialize();
 
 $('main').addEventListener('click',event=>{if(isPublic(screen))publicUI?.handleClick(event,render);});
